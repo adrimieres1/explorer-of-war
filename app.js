@@ -2,25 +2,31 @@
 // Explorer of War — app.js
 // ============================================================
 
-const TILE_SIZE   = 256;
-const REVEAL_R    = 70;   // radio de niebla revelada (px a zoom 15)
-const MIN_DIST_M  = 3;    // metros mínimos entre puntos
-const STORAGE_KEY = 'eow_v3';
-const MAX_TRAIL   = 5000; // puntos máximos en memoria
+const TILE_SIZE    = 256;
+const MIN_DIST_M   = 3;      // metros mínimos entre puntos GPS
+const STORAGE_KEY  = 'eow_v4';
+const MAX_TRAIL    = 5000;   // puntos GPS máximos
+const STREET_WIDTH = 14;     // ancho de revelado en metros (media calle)
+const OSM_CACHE_R  = 0.0008; // ~90m en grados, radio para agrupar queries OSM
+const FALLBACK_R   = 18;     // px de fallback si OSM falla
 
 // ── Estado global ──────────────────────────────────────────
 let zoom       = 15;
-let centerLat  = 43.3619, centerLon = -5.8494; // Oviedo por defecto
+let centerLat  = 43.3619, centerLon = -5.8494;
 let offsetX    = 0, offsetY = 0;
 let lastPos    = null;
 let totalDist  = 0;
-let trailPts   = [];      // [{lat, lon}]
+let trailPts   = [];       // [{lat, lon}] puntos GPS
+let streetSegs = [];       // [{nodes: [{lat,lon}], width}] segmentos de calle revelados
 let autoCenter = true;
 let watchId    = null;
 let demoTimer  = null;
 let isDragging = false;
 let dragStart  = null;
 let pinchDist  = null;
+
+// Cache de queries OSM ya realizadas (evita spam a la API)
+const osmQueried = new Set();
 
 // ── Canvas ──────────────────────────────────────────────────
 const baseCanvas  = document.getElementById('base-map');
@@ -121,26 +127,129 @@ function redrawTrail() {
   trailCtx.stroke();
 }
 
+// ── Conversión metros → píxeles ─────────────────────────────
+function metersToPixels(meters, lat) {
+  const mpp = (156543.03392 * Math.cos(lat * Math.PI / 180)) / Math.pow(2, zoom);
+  return meters / mpp;
+}
+
+// ── Fog of War por calles ───────────────────────────────────
 function redrawFog() {
   const w = fogCanvas.width, h = fogCanvas.height;
   fogCtx.clearRect(0, 0, w, h);
   fogCtx.fillStyle = 'rgba(5,10,5,0.94)';
   fogCtx.fillRect(0, 0, w, h);
-  if (trailPts.length === 0) return;
+  if (streetSegs.length === 0 && trailPts.length === 0) return;
+
   fogCtx.globalCompositeOperation = 'destination-out';
+
+  // Revelar segmentos de calle reales (OSM)
+  for (const seg of streetSegs) {
+    if (!seg.nodes || seg.nodes.length < 2) continue;
+    const halfW = metersToPixels(seg.width || STREET_WIDTH, seg.nodes[0].lat);
+    const pts   = seg.nodes.map(n => latLonToPixel(n.lat, n.lon));
+
+    fogCtx.save();
+    fogCtx.lineWidth   = halfW * 2;
+    fogCtx.lineCap     = 'round';
+    fogCtx.lineJoin    = 'round';
+    fogCtx.strokeStyle = 'rgba(0,0,0,1)';
+    fogCtx.beginPath();
+    pts.forEach((p, i) => i === 0 ? fogCtx.moveTo(p.x, p.y) : fogCtx.lineTo(p.x, p.y));
+    fogCtx.stroke();
+    fogCtx.restore();
+  }
+
+  // Fallback: pequeño círculo en puntos GPS sin calle (por si OSM tarda)
   for (const pt of trailPts) {
+    if (pt.hasStreet) continue;
     const { x, y } = latLonToPixel(pt.lat, pt.lon);
-    const r = REVEAL_R * (zoom / 15);
+    const r = FALLBACK_R * (zoom / 15);
     const g = fogCtx.createRadialGradient(x, y, 0, x, y, r);
-    g.addColorStop(0,   'rgba(0,0,0,1)');
-    g.addColorStop(0.55,'rgba(0,0,0,0.95)');
-    g.addColorStop(1,   'rgba(0,0,0,0)');
+    g.addColorStop(0, 'rgba(0,0,0,1)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
     fogCtx.fillStyle = g;
     fogCtx.beginPath();
     fogCtx.arc(x, y, r, 0, Math.PI * 2);
     fogCtx.fill();
   }
+
   fogCtx.globalCompositeOperation = 'source-over';
+}
+
+// ── OSM Overpass API — buscar calles cercanas ───────────────
+function osmCellKey(lat, lon) {
+  // Cuantiza la posición a celdas de ~90m para no repetir queries
+  return `${(lat / OSM_CACHE_R).toFixed(0)},${(lon / OSM_CACHE_R).toFixed(0)}`;
+}
+
+async function fetchStreetsNear(lat, lon) {
+  const key = osmCellKey(lat, lon);
+  if (osmQueried.has(key)) return;
+  osmQueried.add(key);
+
+  setStatus('Consultando calles OSM...');
+  const r   = 0.001; // ~110m de radio
+  const box = `${lat - r},${lon - r},${lat + r},${lon + r}`;
+  const query = `[out:json][timeout:10];
+way["highway"](${box});
+(._;>;);
+out body;`;
+
+  try {
+    const res  = await fetch('https://overpass-api.de/api/interpreter', {
+      method : 'POST',
+      body   : 'data=' + encodeURIComponent(query)
+    });
+    const data = await res.json();
+    processOSMResponse(data, lat, lon);
+    setStatus(`Calle detectada · ${trailPts.length} puntos`);
+  } catch(e) {
+    setStatus('Sin red, usando fallback circular');
+  }
+}
+
+function processOSMResponse(data, queryLat, queryLon) {
+  if (!data || !data.elements) return;
+
+  // Construir mapa de nodos
+  const nodes = {};
+  for (const el of data.elements) {
+    if (el.type === 'node') nodes[el.id] = { lat: el.lat, lon: el.lon };
+  }
+
+  // Construir segmentos por cada way de tipo carretera
+  for (const el of data.elements) {
+    if (el.type !== 'way' || !el.nodes) continue;
+    const segNodes = el.nodes.map(id => nodes[id]).filter(Boolean);
+    if (segNodes.length < 2) continue;
+
+    // Ancho según tipo de vía
+    const hw    = el.tags && el.tags.highway;
+    const width = streetWidth(hw);
+
+    streetSegs.push({ nodes: segNodes, width });
+
+    // Marcar puntos GPS cercanos como "con calle"
+    for (const pt of trailPts) {
+      if (haversine(pt.lat, pt.lon, queryLat, queryLon) < 120) {
+        pt.hasStreet = true;
+      }
+    }
+  }
+
+  saveData();
+  redrawFog();
+}
+
+function streetWidth(highway) {
+  const map = {
+    motorway: 20, trunk: 18, primary: 16, secondary: 14,
+    tertiary: 12, residential: 10, service: 7,
+    footway: 5, path: 4, cycleway: 5, steps: 4,
+    living_street: 9, unclassified: 10
+  };
+  return map[highway] || 10;
 }
 
 function redrawAll() {
@@ -214,10 +323,11 @@ function showNotif(msg) {
 function saveData() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      pts: trailPts.slice(-MAX_TRAIL),
-      dist: totalDist,
-      lat: lastPos ? lastPos.lat : centerLat,
-      lon: lastPos ? lastPos.lon : centerLon,
+      pts  : trailPts.slice(-MAX_TRAIL),
+      segs : streetSegs.slice(-800),
+      dist : totalDist,
+      lat  : lastPos ? lastPos.lat : centerLat,
+      lon  : lastPos ? lastPos.lon : centerLon,
       zoom
     }));
   } catch(e) {}
@@ -229,12 +339,17 @@ function loadData() {
     if (!raw) return false;
     const d = JSON.parse(raw);
     if (d.pts)  trailPts   = d.pts;
+    if (d.segs) streetSegs = d.segs;
     if (d.dist) totalDist  = d.dist;
     if (d.lat)  centerLat  = d.lat;
     if (d.lon)  centerLon  = d.lon;
     if (d.zoom) zoom       = d.zoom;
+    // Reconstruir set de celdas ya consultadas
+    for (const pt of trailPts) {
+      osmQueried.add(osmCellKey(pt.lat, pt.lon));
+    }
     updateStats();
-    return trailPts.length > 0;
+    return trailPts.length > 0 || streetSegs.length > 0;
   } catch(e) { return false; }
 }
 
@@ -245,7 +360,7 @@ function onPosition(lat, lon, accuracy) {
     if (d < MIN_DIST_M) return;
     totalDist += d;
   }
-  trailPts.push({ lat, lon });
+  trailPts.push({ lat, lon, hasStreet: false });
   if (trailPts.length > MAX_TRAIL) trailPts.shift();
   lastPos = { lat, lon };
 
@@ -253,7 +368,9 @@ function onPosition(lat, lon, accuracy) {
   redrawAll();
   updateMarker(lat, lon, accuracy);
   updateStats();
-  saveData();
+
+  // Consultar OSM para revelar la calle real
+  fetchStreetsNear(lat, lon);
 
   setStatus(`Posición actualizada · ${trailPts.length} puntos`);
 
@@ -306,12 +423,12 @@ const DEMO_ROUTE = [
 ];
 
 function startDemo() {
-  zoom = 15;
+  zoom = 16;
   centerLat = DEMO_ROUTE[0][0];
   centerLon = DEMO_ROUTE[0][1];
   document.getElementById('gps-status').textContent = 'DEMO';
   document.getElementById('gps-dot').classList.add('active');
-  setStatus('Modo demo — simulando paseo por Oviedo...');
+  setStatus('Modo demo — consultando calles de Oviedo en OSM...');
 
   let wpIdx = 0, t = 0;
   demoTimer = setInterval(() => {
@@ -319,10 +436,10 @@ function startDemo() {
     const b = DEMO_ROUTE[(wpIdx + 1) % DEMO_ROUTE.length];
     const lat = a[0] + (b[0] - a[0]) * t;
     const lon = a[1] + (b[1] - a[1]) * t;
-    t += 0.04;
+    t += 0.06;
     if (t >= 1) { t = 0; wpIdx++; }
-    onPosition(lat, lon, 10);
-  }, 350);
+    onPosition(lat, lon, 5);
+  }, 500);
 }
 
 // ── Controles de mapa ─────────────────────────────────────────
